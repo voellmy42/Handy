@@ -193,6 +193,18 @@ function App() {
     };
   }, [t]);
 
+  // Keep provider details in the backend log; only report the raw-text fallback.
+  useEffect(() => {
+    const unlisten = listen("post-processing-error", () => {
+      toast.warning(t("errors.postProcessingFailedTitle"), {
+        description: t("errors.postProcessingFailed"),
+      });
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, [t]);
+
   // Listen for transcription failures and show a toast.
   // The payload is the backend error message (also logged to handy.log).
   useEffect(() => {

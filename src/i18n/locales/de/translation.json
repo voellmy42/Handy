@@ -940,7 +940,9 @@
     "modelLoadFailedUnknown": "unbekanntes Modell",
     "pasteFailedTitle": "Text konnte nicht eingefügt werden",
     "pasteFailed": "Der Text konnte nicht in die aktive Anwendung eingefügt werden.",
-    "transcriptionFailedTitle": "Transkription fehlgeschlagen"
+    "transcriptionFailedTitle": "Transkription fehlgeschlagen",
+    "postProcessingFailedTitle": "Nachbearbeitung fehlgeschlagen",
+    "postProcessingFailed": "Die ursprüngliche Transkription wird verwendet. Prüfe die Einstellungen zur Nachbearbeitung oder die Protokolle für weitere Informationen."
   },
   "appLanguage": {
     "title": "Anwendungssprache",

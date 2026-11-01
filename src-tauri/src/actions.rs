@@ -175,17 +175,20 @@ fn should_use_streaming_overlay(style: OverlayStyle, is_streaming: bool) -> bool
     style == OverlayStyle::Live && is_streaming
 }
 
-async fn post_process_transcription(settings: &AppSettings, transcription: &str) -> Option<String> {
+async fn post_process_transcription(
+    settings: &AppSettings,
+    transcription: &str,
+) -> Result<Option<String>, ()> {
     if is_blank_transcription(transcription) {
         debug!("Post-processing skipped because the transcription is empty");
-        return None;
+        return Ok(None);
     }
 
     let provider = match settings.active_post_process_provider().cloned() {
         Some(provider) => provider,
         None => {
             debug!("Post-processing enabled but no provider is selected");
-            return None;
+            return Ok(None);
         }
     };
 
@@ -200,14 +203,14 @@ async fn post_process_transcription(settings: &AppSettings, transcription: &str)
             "Post-processing skipped because provider '{}' has no model configured",
             provider.id
         );
-        return None;
+        return Ok(None);
     }
 
     let selected_prompt_id = match &settings.post_process_selected_prompt_id {
         Some(id) => id.clone(),
         None => {
             debug!("Post-processing skipped because no prompt is selected");
-            return None;
+            return Ok(None);
         }
     };
 
@@ -222,13 +225,13 @@ async fn post_process_transcription(settings: &AppSettings, transcription: &str)
                 "Post-processing skipped because prompt '{}' was not found",
                 selected_prompt_id
             );
-            return None;
+            return Ok(None);
         }
     };
 
     if prompt.trim().is_empty() {
         debug!("Post-processing skipped because the selected prompt is empty");
-        return None;
+        return Ok(None);
     }
 
     debug!(
@@ -261,7 +264,7 @@ async fn post_process_transcription(settings: &AppSettings, transcription: &str)
                     debug!(
                         "Apple Intelligence selected but not currently available on this device"
                     );
-                    return None;
+                    return Ok(None);
                 }
 
                 let token_limit = model.trim().parse::<i32>().unwrap_or(0);
@@ -273,19 +276,19 @@ async fn post_process_transcription(settings: &AppSettings, transcription: &str)
                     Ok(result) => {
                         if result.trim().is_empty() {
                             debug!("Apple Intelligence returned an empty response");
-                            None
+                            Err(())
                         } else {
                             let result = strip_invisible_chars(&result);
                             debug!(
                                 "Apple Intelligence post-processing succeeded. Output length: {} chars",
                                 result.len()
                             );
-                            Some(result)
+                            Ok(Some(result))
                         }
                     }
                     Err(err) => {
                         error!("Apple Intelligence post-processing failed: {}", err);
-                        None
+                        Err(())
                     }
                 };
             }
@@ -293,7 +296,7 @@ async fn post_process_transcription(settings: &AppSettings, transcription: &str)
             #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
             {
                 debug!("Apple Intelligence provider selected on unsupported platform");
-                return None;
+                return Ok(None);
             }
         }
 
@@ -335,10 +338,10 @@ async fn post_process_transcription(settings: &AppSettings, transcription: &str)
                                 provider.id,
                                 result.len()
                             );
-                            return Some(result);
+                            return Ok(Some(result));
                         } else {
                             error!("Structured output response missing 'transcription' field");
-                            return Some(strip_invisible_chars(content));
+                            return Ok(Some(strip_invisible_chars(content)));
                         }
                     }
                     Err(e) => {
@@ -346,13 +349,13 @@ async fn post_process_transcription(settings: &AppSettings, transcription: &str)
                             "Failed to parse structured output JSON: {}. Returning raw content.",
                             e
                         );
-                        return Some(strip_invisible_chars(content));
+                        return Ok(Some(strip_invisible_chars(content)));
                     }
                 }
             }
             Ok(None) => {
                 error!("LLM API response has no content");
-                return None;
+                return Err(());
             }
             Err(e) => {
                 warn!(
@@ -384,11 +387,11 @@ async fn post_process_transcription(settings: &AppSettings, transcription: &str)
                 provider.id,
                 content.len()
             );
-            Some(content)
+            Ok(Some(content))
         }
         Ok(None) => {
             error!("LLM API response has no content");
-            None
+            Err(())
         }
         Err(e) => {
             error!(
@@ -396,7 +399,7 @@ async fn post_process_transcription(settings: &AppSettings, transcription: &str)
                 provider.id,
                 e
             );
-            None
+            Err(())
         }
     }
 }
@@ -405,6 +408,7 @@ pub(crate) struct ProcessedTranscription {
     pub final_text: String,
     pub post_processed_text: Option<String>,
     pub post_process_prompt: Option<String>,
+    pub post_process_failed: bool,
 }
 
 pub(crate) async fn process_transcription_output(
@@ -412,25 +416,37 @@ pub(crate) async fn process_transcription_output(
     transcription: &str,
     post_process: bool,
 ) -> ProcessedTranscription {
-    let settings = get_settings(app);
+    process_transcription_with_settings(&get_settings(app), transcription, post_process).await
+}
+
+async fn process_transcription_with_settings(
+    settings: &AppSettings,
+    transcription: &str,
+    post_process: bool,
+) -> ProcessedTranscription {
     let mut final_text = transcription.to_string();
     let mut post_processed_text: Option<String> = None;
     let mut post_process_prompt: Option<String> = None;
+    let mut post_process_failed = false;
 
     if post_process {
-        if let Some(processed_text) = post_process_transcription(&settings, &final_text).await {
-            post_processed_text = Some(processed_text.clone());
-            final_text = processed_text;
+        match post_process_transcription(settings, &final_text).await {
+            Ok(Some(processed_text)) => {
+                post_processed_text = Some(processed_text.clone());
+                final_text = processed_text;
 
-            if let Some(prompt_id) = &settings.post_process_selected_prompt_id {
-                if let Some(prompt) = settings
-                    .post_process_prompts
-                    .iter()
-                    .find(|prompt| &prompt.id == prompt_id)
-                {
-                    post_process_prompt = Some(prompt.prompt.clone());
+                if let Some(prompt_id) = &settings.post_process_selected_prompt_id {
+                    if let Some(prompt) = settings
+                        .post_process_prompts
+                        .iter()
+                        .find(|prompt| &prompt.id == prompt_id)
+                    {
+                        post_process_prompt = Some(prompt.prompt.clone());
+                    }
                 }
             }
+            Ok(None) => {}
+            Err(()) => post_process_failed = true,
         }
     }
 
@@ -438,6 +454,7 @@ pub(crate) async fn process_transcription_output(
         final_text,
         post_processed_text,
         post_process_prompt,
+        post_process_failed,
     }
 }
 
@@ -808,6 +825,7 @@ impl ShortcutAction for TranscribeAction {
                                 let ah_clone = ah.clone();
                                 let paste_time = Instant::now();
                                 let final_text = processed.final_text;
+                                let post_process_failed = processed.post_process_failed;
                                 let rm_for_paste = Arc::clone(&rm);
                                 // Taken before the paste thread exists, and so
                                 // before the next session can start.
@@ -826,6 +844,11 @@ impl ShortcutAction for TranscribeAction {
                                             return;
                                         }
 
+                                        // Emit only after the final cancellation guard. Do not
+                                        // claim the original text was pasted: paste can still fail.
+                                        if post_process_failed {
+                                            let _ = ah_clone.emit("post-processing-error", ());
+                                        }
                                         let outcome =
                                             match utils::paste(final_text, ah_clone.clone()) {
                                                 Ok(()) => {
@@ -988,15 +1011,160 @@ pub static ACTION_MAP: Lazy<HashMap<String, Arc<dyn ShortcutAction>>> = Lazy::ne
 #[cfg(test)]
 mod tests {
     use super::{
-        complete_unless_cancelled, is_blank_transcription, should_use_streaming_overlay,
-        strip_think_block,
+        complete_unless_cancelled, is_blank_transcription, process_transcription_with_settings,
+        should_use_streaming_overlay, strip_think_block,
     };
-    use crate::settings::OverlayStyle;
+    use crate::settings::{AppSettings, LLMPrompt, OverlayStyle, PostProcessProvider};
     use std::future;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
+
+    /// Serve complete local HTTP responses; tests never need a model or API key.
+    async fn post_process_settings(
+        structured: bool,
+        responses: Vec<(u16, serde_json::Value)>,
+    ) -> (AppSettings, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for (status, body) in responses {
+                let (mut socket, _) =
+                    tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 1024];
+                loop {
+                    let count =
+                        tokio::time::timeout(Duration::from_secs(5), socket.read(&mut buffer))
+                            .await
+                            .unwrap()
+                            .unwrap();
+                    assert!(count > 0, "request ended before its body");
+                    request.extend_from_slice(&buffer[..count]);
+                    if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&request[..end]);
+                        let length: usize = head
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                let body = body.to_string();
+                let response = format!(
+                    "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let settings = AppSettings {
+            post_process_provider_id: "test".into(),
+            post_process_providers: vec![PostProcessProvider {
+                id: "test".into(),
+                label: "Local test provider".into(),
+                base_url: format!("http://{address}"),
+                allow_base_url_edit: true,
+                models_endpoint: None,
+                supports_structured_output: structured,
+                api_format: Default::default(),
+            }],
+            post_process_models: [("test".into(), "test-model".into())].into(),
+            post_process_prompts: vec![LLMPrompt {
+                id: "test".into(),
+                name: "Test".into(),
+                prompt: "Clean ${output}".into(),
+            }],
+            post_process_selected_prompt_id: Some("test".into()),
+            ..AppSettings::default()
+        };
+        (settings, server)
+    }
+
+    #[tokio::test]
+    async fn failed_post_processing_preserves_original_and_reports_failure() {
+        for structured in [false, true] {
+            let responses = vec![
+                (404, serde_json::json!({"error": "test model unavailable"}));
+                if structured { 2 } else { 1 }
+            ];
+            let (settings, server) = post_process_settings(structured, responses).await;
+            let processed =
+                process_transcription_with_settings(&settings, "Keep exactly 42 records.", true)
+                    .await;
+            server.await.unwrap();
+            assert!(processed.post_process_failed);
+            assert_eq!(processed.final_text, "Keep exactly 42 records.");
+            assert_eq!(processed.post_processed_text, None);
+            assert_eq!(processed.post_process_prompt, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_legacy_retry_does_not_report_failure() {
+        let (settings, server) = post_process_settings(
+            true,
+            vec![
+                (
+                    500,
+                    serde_json::json!({"error": "structured output unavailable"}),
+                ),
+                (
+                    200,
+                    serde_json::json!({"choices": [{"message": {"content": "Cleaned text."}}]}),
+                ),
+            ],
+        )
+        .await;
+        let processed = process_transcription_with_settings(&settings, "original", true).await;
+        server.await.unwrap();
+        assert!(!processed.post_process_failed);
+        assert_eq!(processed.final_text, "Cleaned text.");
+        assert_eq!(
+            processed.post_processed_text.as_deref(),
+            Some("Cleaned text.")
+        );
+        assert_eq!(
+            processed.post_process_prompt.as_deref(),
+            Some("Clean ${output}")
+        );
+    }
+
+    #[tokio::test]
+    async fn skipped_post_processing_does_not_report_failure() {
+        let settings = AppSettings::default();
+        for (text, enabled) in [
+            ("plain dictation", false),
+            ("no prompt configured", true),
+            (" ", true),
+        ] {
+            let processed = process_transcription_with_settings(&settings, text, enabled).await;
+            assert!(!processed.post_process_failed);
+            assert_eq!(processed.final_text, text);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_post_processing_does_not_return_a_failure_to_deliver() {
+        let settings = AppSettings::default();
+        let processed = complete_unless_cancelled(
+            process_transcription_with_settings(&settings, "cancelled", true),
+            || true,
+        )
+        .await;
+        assert!(processed.is_none());
+    }
 
     #[test]
     fn blank_transcription_is_detected() {
